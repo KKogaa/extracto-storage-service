@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: extracto-storage-service
+  namespace: extracto
+  labels:
+    app: extracto-storage-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: extracto-storage-service
+  template:
+    metadata:
+      labels:
+        app: extracto-storage-service
+    spec:
+      imagePullSecrets:
+      - name: ghcr-secret
+      containers:
+      - name: storage
+        image: ghcr.io/kkogaa/extracto-storage-service:IMAGE_TAG
+        imagePullPolicy: Always
+        env:
+        - name: REDIS_HOST
+          value: "redis.extracto.svc.cluster.local"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: MONGODB_URI
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-secret
+              key: MONGODB_URI
+        - name: MONGODB_DATABASE
+          value: "extracto"
+        - name: NODE_ENV
+          value: "production"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
