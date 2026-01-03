@@ -24,6 +24,11 @@ export class UrbaniaStrategy implements ExtractionStrategy {
         return this.extractFromHTML(data, url, jobId);
       }
 
+      // If data is an object with parsed JSON (from extractedData.data)
+      if (typeof data === 'object' && !data.html) {
+        return this.extractFromJSON(data, url, jobId);
+      }
+
       console.log('⚠️  Urbania: Unsupported data format');
       return [];
     } catch (error) {
@@ -32,14 +37,137 @@ export class UrbaniaStrategy implements ExtractionStrategy {
     }
   }
 
+  private extractFromJSON(data: any, url: string, jobId?: string): RealEstateListing[] {
+    try {
+      console.log('Attempting to extract Urbania listings from JSON data');
+      
+      // Check if data is an array of listings (common API response format)
+      if (Array.isArray(data)) {
+        return data.map(item => this.parseJsonListing(item, url, jobId)).filter(Boolean) as RealEstateListing[];
+      }
+      
+      // Check for nested listings array
+      if (data.listings && Array.isArray(data.listings)) {
+        return data.listings.map((item: any) => this.parseJsonListing(item, url, jobId)).filter(Boolean) as RealEstateListing[];
+      }
+      
+      // Check for results array
+      if (data.results && Array.isArray(data.results)) {
+        return data.results.map((item: any) => this.parseJsonListing(item, url, jobId)).filter(Boolean) as RealEstateListing[];
+      }
+      
+      // Single listing object
+      if (data.id || data.listingId) {
+        const listing = this.parseJsonListing(data, url, jobId);
+        return listing ? [listing] : [];
+      }
+      
+      console.log('⚠️  Could not find listings array in JSON data');
+      return [];
+    } catch (error) {
+      console.error('JSON extraction error:', error);
+      return [];
+    }
+  }
+
+  private parseJsonListing(item: any, url: string, jobId?: string): RealEstateListing | null {
+    try {
+      const listing: RealEstateListing = {
+        listingId: String(item.id || item.listingId || item.propertyId || `unknown-${Date.now()}`),
+        source: {
+          url: item.url || item.link || url,
+          domain: 'urbania.pe',
+          scrapedAt: new Date(),
+          jobId,
+        },
+        title: item.title || item.name || 'Sin título',
+        description: item.description || undefined,
+        listingType: this.determineListingType(item),
+        propertyType: this.determinePropertyType(item),
+        price: {
+          amount: parseFloat(item.price?.amount || item.price || 0),
+          currency: item.price?.currency || 'PEN',
+          period: item.price?.period || this.determinePricePeriod(url, item),
+        },
+        location: {
+          country: 'Peru',
+          city: item.location?.city || item.city || undefined,
+          district: item.location?.district || item.district || undefined,
+          region: item.location?.region || item.region || undefined,
+          address: item.location?.address || item.address || undefined,
+        },
+        details: {
+          bedrooms: parseInt(item.bedrooms || item.rooms || 0) || undefined,
+          bathrooms: parseInt(item.bathrooms || 0) || undefined,
+          parkingSpaces: parseInt(item.parking || item.parkingSpaces || 0) || undefined,
+          totalArea: parseFloat(item.area || item.totalArea || 0) || undefined,
+        },
+        images: item.images || (item.image ? [item.image] : undefined),
+      };
+
+      return listing;
+    } catch (error) {
+      console.error('Failed to parse JSON listing:', error);
+      return null;
+    }
+  }
+
+  private determineListingType(item: any): RealEstateListing['listingType'] {
+    const type = (item.type || item.listingType || '').toLowerCase();
+    if (type.includes('alquiler') || type.includes('rent')) return 'rent';
+    if (type.includes('venta') || type.includes('sale')) return 'sale';
+    return 'other';
+  }
+
+  private determinePropertyType(item: any): RealEstateListing['propertyType'] {
+    const type = (item.propertyType || item.category || '').toLowerCase();
+    if (type.includes('departamento') || type.includes('apartment')) return 'apartment';
+    if (type.includes('casa') || type.includes('house')) return 'house';
+    if (type.includes('terreno') || type.includes('land')) return 'land';
+    if (type.includes('oficina') || type.includes('office')) return 'office';
+    return 'other';
+  }
+
+  private determinePricePeriod(url: string, item: any): 'monthly' | 'one_time' {
+    const urlLower = url.toLowerCase();
+    const isRent = urlLower.includes('alquiler') || urlLower.includes('rent') ||
+                   (item.type && item.type.toLowerCase().includes('rent'));
+    return isRent ? 'monthly' : 'one_time';
+  }
+
   private extractFromHTML(html: string, url: string, jobId?: string): RealEstateListing[] {
     const $ = load(html);
     const listings: RealEstateListing[] = [];
 
-    // Urbania uses specific selectors for listing cards
-    // These may need to be updated based on the actual HTML structure
-    const listingCards = $('.listing-card, .property-card, [data-property-id]');
+    // First, try to extract JSON-LD structured data from script tags
+    const jsonLdScripts = $('script[type="application/ld+json"]');
+    console.log(`Found ${jsonLdScripts.length} JSON-LD script tags`);
+    
+    jsonLdScripts.each((_, element) => {
+      try {
+        const scriptContent = $(element).html();
+        if (scriptContent) {
+          const jsonData = JSON.parse(scriptContent);
+          
+          // Handle RealEstateListing schema
+          if (jsonData['@type'] === 'RealEstateListing') {
+            const extracted = this.extractFromJsonLd(jsonData, url, jobId);
+            listings.push(...extracted);
+          }
+        }
+      } catch (e) {
+        console.log('Failed to parse JSON-LD:', e instanceof Error ? e.message : e);
+      }
+    });
 
+    if (listings.length > 0) {
+      console.log(`✅ Extracted ${listings.length} listings from JSON-LD`);
+      return listings;
+    }
+
+    // Fallback: try traditional HTML selectors
+    console.log('No JSON-LD data found, trying HTML selectors...');
+    const listingCards = $('.listing-card, .property-card, [data-property-id]');
     console.log(`Found ${listingCards.length} potential listings on page`);
 
     listingCards.each((index, element) => {
@@ -105,6 +233,88 @@ export class UrbaniaStrategy implements ExtractionStrategy {
 
     console.log(`✅ Successfully extracted ${listings.length} Urbania listings`);
     return listings;
+  }
+
+  private extractFromJsonLd(jsonData: any, url: string, jobId?: string): RealEstateListing[] {
+    const listings: RealEstateListing[] = [];
+    
+    try {
+      // Handle mainEntity array (multiple listings)
+      if (jsonData.mainEntity && Array.isArray(jsonData.mainEntity)) {
+        for (const entity of jsonData.mainEntity) {
+          const listing = this.parseJsonLdEntity(entity, jsonData, url, jobId);
+          if (listing) listings.push(listing);
+        }
+      }
+      // Single listing
+      else if (jsonData.name || jsonData.description) {
+        const listing = this.parseJsonLdEntity(jsonData, jsonData, url, jobId);
+        if (listing) listings.push(listing);
+      }
+    } catch (error) {
+      console.error('Error extracting from JSON-LD:', error);
+    }
+    
+    return listings;
+  }
+
+  private parseJsonLdEntity(entity: any, parent: any, url: string, jobId?: string): RealEstateListing | null {
+    try {
+      // Extract listing ID from URL
+      const listingUrl = entity.url || parent.url || url;
+      const listingId = this.generateIdFromUrl(listingUrl);
+      
+      // Extract price from offers
+      const offers = entity.offers || parent.offers;
+      let priceAmount = 0;
+      let priceCurrency = 'PEN';
+      
+      if (offers) {
+        if (offers['@type'] === 'AggregateOffer') {
+          priceAmount = parseFloat(offers.lowPrice || offers.highPrice || 0);
+        } else {
+          priceAmount = parseFloat(offers.price || 0);
+        }
+        priceCurrency = offers.priceCurrency || 'PEN';
+      }
+      
+      // Extract location
+      const contentLocation = entity.contentLocation || {};
+      const location: RealEstateListing['location'] = {
+        country: 'Peru',
+        district: contentLocation.name || undefined,
+      };
+      
+      // Determine types from URL and description
+      const types = this.determineTypes(listingUrl, entity.name || '');
+      
+      const listing: RealEstateListing = {
+        listingId,
+        source: {
+          url: listingUrl,
+          domain: 'urbania.pe',
+          scrapedAt: new Date(),
+          jobId,
+        },
+        title: entity.name || 'Sin título',
+        description: entity.description || undefined,
+        listingType: types.listingType,
+        propertyType: types.propertyType,
+        price: {
+          amount: priceAmount,
+          currency: priceCurrency,
+          period: types.listingType === 'rent' ? 'monthly' : 'one_time',
+        },
+        location,
+        details: {},
+        images: entity.image ? [entity.image] : undefined,
+      };
+      
+      return listing;
+    } catch (error) {
+      console.error('Failed to parse JSON-LD entity:', error);
+      return null;
+    }
   }
 
   private parsePrice(priceText: string, url: string): RealEstateListing['price'] {
