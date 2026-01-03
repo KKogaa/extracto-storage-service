@@ -19,7 +19,7 @@ spec:
       - name: ghcr-secret
       containers:
       - name: storage
-        image: ghcr.io/kkogaa/extracto-storage-service:e5ceaac
+        image: ghcr.io/kkogaa/extracto-storage-service:7867a45
         imagePullPolicy: Always
         env:
         - name: REDIS_HOST
