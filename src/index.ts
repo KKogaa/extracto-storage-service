@@ -1,5 +1,6 @@
 import { StorageService } from './services/storage.service';
 import { ProductStorageService } from './services/product-storage.service';
+import { RealEstateStorageService } from './services/real-estate-storage.service';
 import { QueueListenerService } from './services/queue-listener.service';
 import { CONFIG } from './config';
 
@@ -11,12 +12,14 @@ async function main() {
 
   const storageService = new StorageService();
   const productStorage = new ProductStorageService();
-  const queueListener = new QueueListenerService(storageService, productStorage);
+  const realEstateStorage = new RealEstateStorageService();
+  const queueListener = new QueueListenerService(storageService, productStorage, realEstateStorage);
 
   try {
     // Connect to MongoDB
     await storageService.connect();
     await productStorage.connect();
+    await realEstateStorage.connect();
 
     // Start listening to queue
     await queueListener.start();
@@ -30,6 +33,9 @@ async function main() {
         
         const productStats = await productStorage.getStats();
         console.log('MongoDB Stats (Products):', productStats);
+
+        const realEstateStats = await realEstateStorage.getStats();
+        console.log('MongoDB Stats (Real Estate):', realEstateStats);
       } catch (error) {
         console.error('Failed to get stats:', error);
       }
@@ -38,6 +44,7 @@ async function main() {
     console.log('Extracto Storage Service is running');
     console.log('✓ Scrape jobs will be saved to: scrape_jobs collection');
     console.log('✓ Products will be extracted and saved to: products collection');
+    console.log('✓ Real estate listings will be extracted and saved to: real_estate_listings collection');
   } catch (error) {
     console.error('Fatal error:', error);
     await cleanup(storageService, productStorage, queueListener);
@@ -61,12 +68,16 @@ async function main() {
 async function cleanup(
   storageService: StorageService,
   productStorage: ProductStorageService,
-  queueListener: QueueListenerService
+  queueListener: QueueListenerService,
+  realEstateStorage?: RealEstateStorageService
 ): Promise<void> {
   try {
     await queueListener.close();
     await storageService.close();
     await productStorage.close();
+    if (realEstateStorage) {
+      await realEstateStorage.close();
+    }
     console.log('Cleanup completed');
   } catch (error) {
     console.error('Error during cleanup:', error);

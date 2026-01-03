@@ -3,6 +3,8 @@ import { CONFIG } from '../config';
 import { StorageService } from './storage.service';
 import { ProductExtractorService } from './product-extractor.service';
 import { ProductStorageService } from './product-storage.service';
+import { RealEstateExtractorService } from './real-estate-extractor.service';
+import { RealEstateStorageService } from './real-estate-storage.service';
 import type { FetchResult } from '../types';
 
 export class QueueListenerService {
@@ -11,11 +13,19 @@ export class QueueListenerService {
   private storageService: StorageService;
   private productExtractor: ProductExtractorService;
   private productStorage: ProductStorageService;
+  private realEstateExtractor: RealEstateExtractorService;
+  private realEstateStorage: RealEstateStorageService;
 
-  constructor(storageService: StorageService, productStorage?: ProductStorageService) {
+  constructor(
+    storageService: StorageService,
+    productStorage?: ProductStorageService,
+    realEstateStorage?: RealEstateStorageService
+  ) {
     this.storageService = storageService;
     this.productExtractor = new ProductExtractorService();
     this.productStorage = productStorage || new ProductStorageService();
+    this.realEstateExtractor = new RealEstateExtractorService();
+    this.realEstateStorage = realEstateStorage || new RealEstateStorageService();
 
     this.queue = new Queue(CONFIG.queue.name, {
       connection: {
@@ -45,8 +55,12 @@ export class QueueListenerService {
 
         console.log(`Successfully stored job ${jobId}`);
 
-        // Extract and save products if extractedData exists
-        await this.extractAndSaveProducts(result);
+        // Determine if this is a real estate site or product site
+        if (this.realEstateExtractor.isRealEstateSite(result.url)) {
+          await this.extractAndSaveRealEstate(result);
+        } else {
+          await this.extractAndSaveProducts(result);
+        }
 
         // Clean up the job from Redis after successful processing
         const job = await this.queue.getJob(jobId);
@@ -144,6 +158,50 @@ export class QueueListenerService {
       );
     } catch (error) {
       console.error(`❌ Failed to extract/save products for job ${result.jobId}:`, error);
+    }
+  }
+
+  /**
+   * Extract real estate listings from completed job and save to real_estate_listings collection
+   */
+  private async extractAndSaveRealEstate(result: FetchResult): Promise<void> {
+    console.log(`[DEBUG] Job ${result.jobId} - Detected real estate site, extracting listings...`);
+
+    try {
+      // For real estate, we primarily work with HTML
+      const dataToExtract = result.html || result.extractedData;
+
+      if (!dataToExtract) {
+        console.log(`⚠️  Job ${result.jobId} has no HTML or extractedData for real estate extraction`);
+        return;
+      }
+
+      // Extract listings using strategy pattern (auto-detects site)
+      const extraction = this.realEstateExtractor.extractListings(
+        dataToExtract,
+        result.url,
+        result.jobId
+      );
+
+      if (extraction.listings.length === 0) {
+        console.log(`⚠️  No listings extracted from job ${result.jobId}`);
+        console.log(`[DEBUG] Strategy used: ${extraction.metadata.strategyUsed}`);
+        console.log(`[DEBUG] Extraction errors:`, extraction.metadata.errors);
+        return;
+      }
+
+      console.log(
+        `✅ Extracted ${extraction.listings.length} real estate listings using ${extraction.metadata.strategyUsed} strategy`
+      );
+
+      // Save listings with upsert logic
+      const stats = await this.realEstateStorage.upsertListings(extraction.listings);
+
+      console.log(
+        `✅ Listing upsert complete for job ${result.jobId}: ${stats.inserted} new, ${stats.updated} updated, ${stats.errors} errors`
+      );
+    } catch (error) {
+      console.error(`❌ Failed to extract/save real estate listings for job ${result.jobId}:`, error);
     }
   }
 
