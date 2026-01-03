@@ -56,7 +56,11 @@ export class QueueListenerService {
         console.log(`Successfully stored job ${jobId}`);
 
         // Determine if this is a real estate site or product site
-        if (this.realEstateExtractor.isRealEstateSite(result.url)) {
+        // Check both URL and extract domain from URL for matching
+        const isRealEstate = this.realEstateExtractor.isRealEstateSite(result.url) || 
+                             this.isRealEstateDomain(result.url);
+        
+        if (isRealEstate) {
           await this.extractAndSaveRealEstate(result);
         } else {
           await this.extractAndSaveProducts(result);
@@ -106,6 +110,27 @@ export class QueueListenerService {
     this.queueEvents.on('error', (error) => {
       console.error('Queue events error:', error);
     });
+  }
+
+  /**
+   * Check if URL domain is a real estate site by extracting domain
+   */
+  private isRealEstateDomain(url: string): boolean {
+    try {
+      const urlObj = new URL(url);
+      const hostname = urlObj.hostname.replace(/^www\./, '');
+      
+      const realEstateDomains = [
+        'urbania.pe',
+        'adondevivir.com',
+        'properati.com.pe',
+        'nexoinmobiliario.pe',
+      ];
+      
+      return realEstateDomains.some(domain => hostname.includes(domain));
+    } catch (error) {
+      return false;
+    }
   }
 
   /**

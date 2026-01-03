@@ -171,8 +171,9 @@ export class UrbaniaStrategy implements ExtractionStrategy {
     const images: string[] = [];
 
     // Find images in various common locations
-    $card.find('img').each((_, img) => {
-      const src = $(img).attr('src') || $(img).attr('data-src');
+    $card.find('img').each((_: any, img: any) => {
+      const $img = $card.constructor(img);
+      const src = $img.attr('src') || $img.attr('data-src');
       if (src && !src.includes('placeholder') && !src.includes('logo')) {
         // Convert relative URLs to absolute
         const absoluteUrl = src.startsWith('http') ? src : `https://urbania.pe${src}`;
