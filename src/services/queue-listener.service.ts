@@ -122,9 +122,13 @@ export class QueueListenerService {
       
       const realEstateDomains = [
         'urbania.pe',
+        'urbania',  // Handle cases where only domain name is saved
         'adondevivir.com',
+        'adondevivir',
         'properati.com.pe',
+        'properati',
         'nexoinmobiliario.pe',
+        'nexoinmobiliario',
       ];
       
       return realEstateDomains.some(domain => hostname.includes(domain));
