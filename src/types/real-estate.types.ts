@@ -27,7 +27,10 @@ export interface RealEstateListing {
     amount: number;
     currency: string;
     period?: 'monthly' | 'daily' | 'one_time'; // For rent vs sale
-    pricePerSqm?: number; // Price per square meter
+    pricePerSqm?: number; // Price per square meter (in `currency`)
+    usdAmount?: number; // Price in USD when the listing shows both currencies
+    maintenance?: number; // Mantenimiento / expensas (recurring fee)
+    maintenanceCurrency?: string;
   };
 
   // Location
@@ -35,7 +38,8 @@ export interface RealEstateListing {
     country?: string;
     region?: string; // Department/State
     city?: string;
-    district?: string; // District/Neighborhood
+    district?: string; // District (e.g. San Isidro)
+    neighborhood?: string; // Sub-zone within the district (e.g. Golf, Corpac)
     address?: string;
     coordinates?: {
       lat: number;

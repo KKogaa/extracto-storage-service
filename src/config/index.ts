@@ -15,4 +15,8 @@ export const CONFIG = {
   queue: {
     name: 'fetch-queue',
   },
+  // Listings not seen within this window are marked inactive (delisted).
+  // Defaults to 26h so a single missed 12h crawl never falsely delists.
+  staleListingHours: parseInt(process.env.STALE_LISTING_HOURS || '26', 10),
+  staleSweepIntervalMinutes: parseInt(process.env.STALE_SWEEP_INTERVAL_MINUTES || '60', 10),
 } as const;

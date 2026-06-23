@@ -135,11 +135,302 @@ export class UrbaniaStrategy implements ExtractionStrategy {
     return isRent ? 'monthly' : 'one_time';
   }
 
+  /**
+   * Extract listings from Urbania posting cards (div[data-to-posting]).
+   * These carry the structured detail fields shown on the results page:
+   * maintenance (expensas), total area, bedrooms, bathrooms, parking, and the
+   * exact street address.
+   */
+  private extractFromCards($: any, url: string, jobId?: string): RealEstateListing[] {
+    const listings: RealEstateListing[] = [];
+    const cards = $('div[data-to-posting]');
+    console.log(`Found ${cards.length} Urbania posting cards`);
+
+    // Publish dates live in the JSON-LD; map them by numeric listing id.
+    const datePostedById = this.buildDatePostedMap($);
+
+    // The search URL is the canonical source of district/city/region and the
+    // property/listing type (every result belongs to the searched district).
+    const ctx = this.parseSearchContext(url);
+
+    cards.each((_: any, el: any) => {
+      try {
+        const $card = $(el);
+
+        const href = $card.attr('data-to-posting') || $card.find('a').first().attr('href') || '';
+        const listingUrl = href
+          ? (href.startsWith('http') ? href : `https://urbania.pe${href}`)
+          : url;
+        const listingId = $card.attr('data-id') || this.generateIdFromUrl(listingUrl);
+
+        if (!listingId) return;
+
+        // Price (e.g. "S/ 4,565 · USD 1,350")
+        const priceText = $card.find('[data-qa="POSTING_CARD_PRICE"]').first().text().trim();
+        const price = this.parseCardPrice(priceText, url);
+
+        // Maintenance / expensas (e.g. "S/ 288 Mantenimiento")
+        const expensasText = $card.find('[data-qa="expensas"]').first().text().trim();
+        const maintenance = this.parseMaintenance(expensasText);
+        if (maintenance) {
+          price.maintenance = maintenance.amount;
+          price.maintenanceCurrency = maintenance.currency;
+        }
+
+        // Features: area, bedrooms, bathrooms, parking
+        const details = this.parseCardFeatures($, $card);
+
+        // Price per m² (in the primary currency) when both are known.
+        const area = details.totalArea || details.builtArea;
+        if (price.amount && area) {
+          price.pricePerSqm = Math.round((price.amount / area) * 100) / 100;
+        }
+
+        const publishedAt = datePostedById.get(String(listingId));
+
+        // Exact street address (e.g. "Av. Javier Prado Este")
+        const address = $card
+          .find('[class*="location-address"]')
+          .first()
+          .text()
+          .trim();
+        // Card location text is "[neighborhood, ] district[, city]" — use the
+        // canonical district/city from the search URL and keep the finer
+        // sub-zone (Golf, Corpac, ...) as the neighborhood.
+        const locationText = $card.find('[data-qa="POSTING_CARD_LOCATION"]').first().text().trim();
+        const district = ctx.district || this.fallbackDistrict(locationText);
+        const neighborhood = this.extractNeighborhood(locationText, district, ctx.city);
+        const location: RealEstateListing['location'] = {
+          country: 'Peru',
+          region: ctx.region,
+          city: ctx.city,
+          district,
+          neighborhood,
+          address: address || undefined,
+        };
+
+        const description = $card.find('[data-qa="POSTING_CARD_DESCRIPTION"]').first().text().trim();
+        const images = this.extractCardImages($, $card);
+
+        const title = address
+          ? `${address}${district ? ', ' + district : ''}`
+          : (description.slice(0, 80) || 'Sin título');
+        // Prefer the search URL for type; fall back to title/description text.
+        const fallbackTypes = this.determineTypes(url, `${title} ${description}`);
+
+        listings.push({
+          listingId: String(listingId),
+          source: {
+            url: listingUrl,
+            domain: 'urbania.pe',
+            scrapedAt: new Date(),
+            jobId,
+          },
+          title,
+          description: description || undefined,
+          listingType: ctx.listingType || fallbackTypes.listingType,
+          propertyType: ctx.propertyType || fallbackTypes.propertyType,
+          price,
+          location,
+          details,
+          images: images.length > 0 ? images : undefined,
+          metadata: publishedAt ? { publishedAt } : undefined,
+        });
+      } catch (error) {
+        console.error('Failed to parse Urbania posting card:', error);
+      }
+    });
+
+    return listings;
+  }
+
+  /**
+   * Build a map of numeric listing id -> publish date by reading the
+   * RealEstateListing JSON-LD block (mainEntity[].datePosted, e.g. "6/20/26").
+   */
+  private buildDatePostedMap($: any): Map<string, Date> {
+    const map = new Map<string, Date>();
+    $('script[type="application/ld+json"]').each((_: any, el: any) => {
+      try {
+        const j = JSON.parse($(el).html() || '');
+        if (j['@type'] !== 'RealEstateListing' || !Array.isArray(j.mainEntity)) return;
+        for (const entity of j.mainEntity) {
+          const id = (String(entity.url || '').match(/(\d+)(?:\?|$)/) || [])[1];
+          const date = this.parseUsDate(entity.datePosted);
+          if (id && date) map.set(id, date);
+        }
+      } catch {
+        // ignore malformed JSON-LD
+      }
+    });
+    return map;
+  }
+
+  /** Parse Urbania's "M/D/YY" datePosted into a Date (year assumed 2000+). */
+  private parseUsDate(raw?: string): Date | null {
+    if (!raw) return null;
+    const m = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+    if (!m) return null;
+    const month = parseInt(m[1], 10) - 1;
+    const day = parseInt(m[2], 10);
+    let year = parseInt(m[3], 10);
+    if (year < 100) year += 2000;
+    const d = new Date(Date.UTC(year, month, day));
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  /**
+   * Parse the search URL, e.g.
+   *   /buscar/alquiler-de-departamentos-en-san-isidro--lima--lima
+   * into the canonical listing/property type and district/city/region.
+   */
+  private parseSearchContext(url: string): {
+    listingType?: RealEstateListing['listingType'];
+    propertyType?: RealEstateListing['propertyType'];
+    district?: string;
+    city?: string;
+    region?: string;
+  } {
+    const ctx: any = {};
+    try {
+      const seg = (new URL(url).pathname.split('/').filter(Boolean).pop() || '').toLowerCase();
+      const i = seg.indexOf('-en-');
+      if (i < 0) return ctx;
+
+      const typePart = seg.slice(0, i);
+      const locPart = seg.slice(i + 4);
+
+      if (/alquiler|rent/.test(typePart)) ctx.listingType = 'rent';
+      else if (/venta|sale/.test(typePart)) ctx.listingType = 'sale';
+
+      if (/departamento|apartment/.test(typePart)) ctx.propertyType = 'apartment';
+      else if (/casa|house/.test(typePart)) ctx.propertyType = 'house';
+      else if (/oficina|office/.test(typePart)) ctx.propertyType = 'office';
+      else if (/terreno|land/.test(typePart)) ctx.propertyType = 'land';
+
+      const parts = locPart.split('--').map((s) => this.titleCase(s.replace(/-/g, ' ').trim())).filter(Boolean);
+      if (parts[0]) ctx.district = parts[0];
+      if (parts[1]) ctx.city = parts[1];
+      if (parts[2]) ctx.region = parts[2];
+    } catch {
+      // ignore malformed URL
+    }
+    return ctx;
+  }
+
+  /** District fallback from the card text when the URL can't be parsed. */
+  private fallbackDistrict(locationText: string): string | undefined {
+    const parts = locationText.split(',').map((s) => s.trim()).filter(Boolean);
+    // Card text is "[neighborhood, ] district[, city]"; the district is the
+    // second-to-last part when a city is present, else the last part.
+    if (parts.length >= 3) return parts[parts.length - 2];
+    if (parts.length === 2) return parts[1];
+    return parts[0] || undefined;
+  }
+
+  /** The finest sub-zone in the card text that isn't the district or city. */
+  private extractNeighborhood(locationText: string, district?: string, city?: string): string | undefined {
+    const parts = locationText.split(',').map((s) => s.trim()).filter(Boolean);
+    const skip = new Set([district?.toLowerCase(), city?.toLowerCase(), 'lima', 'peru']);
+    const hood = parts.find((p) => !skip.has(p.toLowerCase()));
+    return hood && hood.toLowerCase() !== district?.toLowerCase() ? hood : undefined;
+  }
+
+  private titleCase(s: string): string {
+    return s.replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+
+  /**
+   * Parse "S/ 4,565 · USD 1,350" -> primary amount in PEN (S/) plus the USD
+   * amount when present. Falls back to USD as primary if no PEN is shown.
+   */
+  private parseCardPrice(priceText: string, url: string): RealEstateListing['price'] {
+    const isRent = /alquiler|rent/i.test(url);
+    const period: 'monthly' | 'one_time' = isRent ? 'monthly' : 'one_time';
+
+    const pen = this.toNumber((priceText.match(/S\/\s*([\d.,]+)/) || [])[1] || '');
+    const usd = this.toNumber((priceText.match(/(?:USD|US\$|\$)\s*([\d.,]+)/i) || [])[1] || '');
+
+    const price: RealEstateListing['price'] = pen
+      ? { amount: pen, currency: 'PEN', period }
+      : { amount: usd, currency: usd ? 'USD' : 'PEN', period };
+
+    // Keep the USD figure alongside whenever the listing shows it.
+    if (usd && price.currency !== 'USD') {
+      price.usdAmount = usd;
+    }
+    return price;
+  }
+
+  /** Parse "S/ 288 Mantenimiento" -> { amount: 288, currency: 'PEN' }. */
+  private parseMaintenance(text: string): { amount: number; currency: string } | null {
+    if (!text) return null;
+    const usd = /USD|US\$|\$/i.test(text) && !/S\//.test(text);
+    const match = text.match(/([\d.,]+)/);
+    if (!match) return null;
+    const amount = this.toNumber(match[1]);
+    if (!amount) return null;
+    return { amount, currency: usd ? 'USD' : 'PEN' };
+  }
+
+  /** Parse feature spans: "72 m² tot.", "3 dorm.", "2 baños", "2 estac." */
+  private parseCardFeatures($: any, $card: any): RealEstateListing['details'] {
+    const details: RealEstateListing['details'] = {};
+    $card.find('[data-qa="POSTING_CARD_FEATURES"] span').each((_: any, el: any) => {
+      const t = $(el).text().replace(/\s+/g, ' ').trim();
+      const num = this.toNumber((t.match(/[\d.,]+/) || [])[0] || '');
+      if (!t) return;
+      if (/m²|m2/i.test(t)) {
+        // "tot." = total area, "cub." = built/covered area
+        if (/cub/i.test(t)) details.builtArea = num;
+        else details.totalArea = num;
+      } else if (/dorm|hab|amb/i.test(t)) {
+        details.bedrooms = num || undefined;
+      } else if (/baño|bano/i.test(t)) {
+        details.bathrooms = num || undefined;
+      } else if (/estac|coch|garage|parking/i.test(t)) {
+        details.parkingSpaces = num || undefined;
+      }
+    });
+    return details;
+  }
+
+  private extractCardImages($: any, $card: any): string[] {
+    const images: string[] = [];
+    $card.find('img').each((_: any, img: any) => {
+      const src = $(img).attr('src') || $(img).attr('data-src') || '';
+      // Real listing photos live under /avisos/. Exclude agency logos
+      // (/empresas/, "logo"), UI icons and arrows (.svg, /listado/).
+      if (/\/avisos\//.test(src) && !/\.svg(\?|$)/.test(src) && !/logo/i.test(src)) {
+        const clean = src.split('?')[0];
+        if (!images.includes(clean)) images.push(clean);
+      }
+    });
+    return images;
+  }
+
+  /** Normalize "4,565" / "72.90" -> number, treating comma as thousands sep. */
+  private toNumber(raw: string): number {
+    if (!raw) return 0;
+    // Remove thousands separators (commas), keep decimal point.
+    const cleaned = raw.replace(/,/g, '');
+    return parseFloat(cleaned) || 0;
+  }
+
   private extractFromHTML(html: string, url: string, jobId?: string): RealEstateListing[] {
     const $ = load(html);
+
+    // Preferred path: parse Urbania posting cards, which carry the full
+    // structured detail (maintenance, area, rooms, bathrooms, parking, address).
+    const cardListings = this.extractFromCards($, url, jobId);
+    if (cardListings.length > 0) {
+      console.log(`✅ Extracted ${cardListings.length} listings from posting cards`);
+      return cardListings;
+    }
+
     const listings: RealEstateListing[] = [];
 
-    // First, try to extract JSON-LD structured data from script tags
+    // Fallback: try to extract JSON-LD structured data from script tags
     const jsonLdScripts = $('script[type="application/ld+json"]');
     console.log(`Found ${jsonLdScripts.length} JSON-LD script tags`);
     

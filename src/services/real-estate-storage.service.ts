@@ -7,9 +7,12 @@ interface StoredListing extends RealEstateListing {
   firstSeenAt: Date;
   lastSeenAt: Date;
   lastUpdatedAt: Date;
+  active: boolean; // false once the listing stops appearing in crawls (delisted)
+  delistedAt?: Date;
   priceHistory?: Array<{
     amount: number;
     currency: string;
+    usdAmount?: number;
     changedAt: Date;
   }>;
 }
@@ -61,6 +64,8 @@ export class RealEstateStorageService {
       await this.collection.createIndex({ 'details.bathrooms': 1 });
       await this.collection.createIndex({ lastSeenAt: -1 });
       await this.collection.createIndex({ firstSeenAt: -1 });
+      await this.collection.createIndex({ active: 1 });
+      await this.collection.createIndex({ active: 1, lastSeenAt: -1 });
 
       // Compound indexes for common queries
       await this.collection.createIndex({ listingType: 1, 'location.district': 1 });
@@ -93,15 +98,8 @@ export class RealEstateStorageService {
 
     for (const listing of listings) {
       try {
-        await this.upsertListing(listing);
-        const uniqueKey = this.generateUniqueKey(listing.source.domain, listing.listingId);
-        const existing = await this.collection?.findOne({ uniqueKey });
-
-        if (existing && existing.firstSeenAt.getTime() === existing.lastSeenAt.getTime()) {
-          stats.inserted++;
-        } else {
-          stats.updated++;
-        }
+        const result = await this.upsertListing(listing);
+        stats[result]++;
       } catch (error) {
         console.error(`Failed to upsert listing ${listing.listingId}:`, error);
         stats.errors++;
@@ -112,64 +110,112 @@ export class RealEstateStorageService {
   }
 
   /**
-   * Upsert a single listing
+   * Upsert a single listing.
+   * - New listing: inserted with the first observed price seeded into history.
+   * - Existing listing: every field is refreshed (details, price, location,
+   *   images, metadata, ...), `firstSeenAt` is preserved, and a price-history
+   *   entry is appended only when the price actually changed.
+   * Returns whether the listing was inserted or updated.
    */
-  private async upsertListing(listing: RealEstateListing): Promise<void> {
+  private async upsertListing(listing: RealEstateListing): Promise<'inserted' | 'updated'> {
     if (!this.collection) {
       throw new Error('MongoDB not connected. Call connect() first.');
     }
 
     const uniqueKey = this.generateUniqueKey(listing.source.domain, listing.listingId);
+    const now = new Date();
 
-    try {
-      const existing = await this.collection.findOne({ uniqueKey });
-      const now = new Date();
+    const existing = await this.collection.findOne({ uniqueKey });
 
-      if (existing) {
-        // Update existing listing
-        const updates: Partial<StoredListing> = {
-          ...listing,
-          uniqueKey,
-          lastSeenAt: now,
-          lastUpdatedAt: now,
-          firstSeenAt: existing.firstSeenAt,
-        };
-
-        // Track price history if price changed
-        if (listing.price.amount !== existing.price.amount) {
-          const priceHistory = existing.priceHistory || [];
-          priceHistory.push({
-            amount: existing.price.amount,
-            currency: existing.price.currency,
-            changedAt: now,
-          });
-          updates.priceHistory = priceHistory;
-        } else {
-          updates.priceHistory = existing.priceHistory;
-        }
-
-        await this.collection.updateOne({ uniqueKey }, { $set: updates });
-      } else {
-        // Insert new listing
-        const newListing: StoredListing = {
-          ...listing,
-          uniqueKey,
-          firstSeenAt: now,
-          lastSeenAt: now,
-          lastUpdatedAt: now,
-          priceHistory: [],
-        };
-
-        await this.collection.insertOne(newListing);
-      }
-    } catch (error) {
-      console.error(`Failed to upsert listing ${uniqueKey}:`, error);
-      throw error;
+    if (!existing) {
+      const firstEntry = this.makePriceEntry(listing, now);
+      const newListing: StoredListing = {
+        ...listing,
+        uniqueKey,
+        firstSeenAt: now,
+        lastSeenAt: now,
+        lastUpdatedAt: now,
+        active: true,
+        priceHistory: firstEntry ? [firstEntry] : [],
+      };
+      await this.collection.insertOne(newListing);
+      return 'inserted';
     }
+
+    // Refresh all values; keep the original firstSeenAt. Seeing the listing
+    // again means it is active (clears any previous delisting).
+    const updates: Partial<StoredListing> = {
+      ...listing,
+      uniqueKey,
+      firstSeenAt: existing.firstSeenAt,
+      lastSeenAt: now,
+      lastUpdatedAt: now,
+      active: true,
+      delistedAt: undefined,
+    };
+
+    // Maintain price history. Backfill a baseline entry for docs that have no
+    // history yet (e.g. created before history seeding); otherwise append only
+    // on a real price change. For USD-priced listings the PEN amount is
+    // FX-converted and drifts daily, so compare on the USD figure when both
+    // records have it to avoid spurious history entries.
+    const priceHistory = existing.priceHistory ? [...existing.priceHistory] : [];
+    if (priceHistory.length === 0 || this.priceChanged(existing, listing)) {
+      const entry = this.makePriceEntry(listing, now);
+      if (entry) priceHistory.push(entry);
+    }
+    updates.priceHistory = priceHistory;
+
+    await this.collection.updateOne({ uniqueKey }, { $set: updates });
+    return 'updated';
+  }
+
+  /** Build a price-history entry from a listing, or null if it has no price. */
+  private makePriceEntry(
+    listing: RealEstateListing,
+    at: Date
+  ): { amount: number; currency: string; usdAmount?: number; changedAt: Date } | null {
+    if (!listing.price?.amount) return null;
+    return {
+      amount: listing.price.amount,
+      currency: listing.price.currency,
+      ...(listing.price.usdAmount != null ? { usdAmount: listing.price.usdAmount } : {}),
+      changedAt: at,
+    };
+  }
+
+  /** True when the listing's price differs from what is stored. */
+  private priceChanged(existing: StoredListing, listing: RealEstateListing): boolean {
+    const bothUsd = existing.price.usdAmount != null && listing.price.usdAmount != null;
+    if (bothUsd) {
+      return existing.price.usdAmount !== listing.price.usdAmount;
+    }
+    return existing.price.amount !== listing.price.amount;
   }
 
   private generateUniqueKey(domain: string, listingId: string): string {
     return `${domain}:${listingId}`;
+  }
+
+  /**
+   * Mark listings not seen since `cutoff` as inactive (delisted). The window
+   * should comfortably exceed the crawl interval so a single missed page does
+   * not falsely delist a listing. Returns the number of newly delisted docs.
+   */
+  async markStaleListingsInactive(cutoff: Date): Promise<number> {
+    if (!this.collection) {
+      throw new Error('MongoDB not connected. Call connect() first.');
+    }
+
+    const result = await this.collection.updateMany(
+      { active: { $ne: false }, lastSeenAt: { $lt: cutoff } },
+      { $set: { active: false, delistedAt: new Date() } }
+    );
+
+    if (result.modifiedCount > 0) {
+      console.log(`Marked ${result.modifiedCount} stale listing(s) as inactive (not seen since ${cutoff.toISOString()})`);
+    }
+    return result.modifiedCount;
   }
 
   /**
@@ -180,44 +226,37 @@ export class RealEstateStorageService {
       return null;
     }
 
-    const [total, byType, byLocation, byPropertyType] = await Promise.all([
-      this.collection.countDocuments(),
+    // Stats reflect live listings only; delisted (inactive) docs are excluded.
+    const activeFilter = { active: { $ne: false } };
+
+    const [total, inactive, byType, byLocation, byPropertyType] = await Promise.all([
+      this.collection.countDocuments(activeFilter),
+      this.collection.countDocuments({ active: false }),
       this.collection
         .aggregate([
-          {
-            $group: {
-              _id: '$listingType',
-              count: { $sum: 1 },
-            },
-          },
+          { $match: activeFilter },
+          { $group: { _id: '$listingType', count: { $sum: 1 } } },
         ])
         .toArray(),
       this.collection
         .aggregate([
-          {
-            $group: {
-              _id: '$location.district',
-              count: { $sum: 1 },
-            },
-          },
+          { $match: activeFilter },
+          { $group: { _id: '$location.district', count: { $sum: 1 } } },
           { $sort: { count: -1 } },
           { $limit: 10 },
         ])
         .toArray(),
       this.collection
         .aggregate([
-          {
-            $group: {
-              _id: '$propertyType',
-              count: { $sum: 1 },
-            },
-          },
+          { $match: activeFilter },
+          { $group: { _id: '$propertyType', count: { $sum: 1 } } },
         ])
         .toArray(),
     ]);
 
     return {
       totalListings: total,
+      delistedListings: inactive,
       byType: byType.reduce((acc, item) => {
         acc[item._id || 'unknown'] = item.count;
         return acc;

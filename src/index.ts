@@ -41,10 +41,23 @@ async function main() {
       }
     }, 30000);
 
+    // Periodically delist real estate listings that have stopped appearing.
+    const sweepStale = async () => {
+      try {
+        const cutoff = new Date(Date.now() - CONFIG.staleListingHours * 60 * 60 * 1000);
+        await realEstateStorage.markStaleListingsInactive(cutoff);
+      } catch (error) {
+        console.error('Stale-listing sweep failed:', error);
+      }
+    };
+    await sweepStale();
+    setInterval(sweepStale, CONFIG.staleSweepIntervalMinutes * 60 * 1000);
+
     console.log('Extracto Storage Service is running');
     console.log('✓ Scrape jobs will be saved to: scrape_jobs collection');
     console.log('✓ Products will be extracted and saved to: products collection');
     console.log('✓ Real estate listings will be extracted and saved to: real_estate_listings collection');
+    console.log(`✓ Listings unseen for ${CONFIG.staleListingHours}h are marked inactive (sweep every ${CONFIG.staleSweepIntervalMinutes}m)`);
   } catch (error) {
     console.error('Fatal error:', error);
     await cleanup(storageService, productStorage, queueListener);
